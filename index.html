@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Registratore</title>
+<meta name="theme-color" content="#2563eb">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Registratore">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1d2330; --muted:#6b7280; --accent:#2563eb; --rec:#dc2626; --line:#e5e7eb; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#12151b; --card:#1b1f27; --fg:#e8eaee; --muted:#9aa3b2; --accent:#60a5fa; --rec:#f87171; --line:#2a303b; }
+  }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.45 -apple-system, system-ui, sans-serif;
+         padding:env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+  main { max-width:560px; margin:0 auto; padding:20px 16px 40px; }
+  h1 { font-size:1.3rem; margin:0 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:16px; }
+  #toggle { width:100%; font:inherit; font-size:1.15rem; font-weight:600; padding:18px; border-radius:12px; border:0;
+            background:var(--accent); color:#fff; }
+  #toggle.on { background:var(--muted); }
+  .status { display:flex; align-items:center; justify-content:center; gap:8px; font-weight:600; margin:14px 0 4px; }
+  .dot { width:12px; height:12px; border-radius:50%; background:var(--muted); }
+  .dot.listening { background:var(--accent); }
+  .dot.recording { background:var(--rec); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.35; } }
+  .sub { text-align:center; color:var(--muted); font-size:.85rem; min-height:1.2em; }
+  .meter { position:relative; height:14px; background:var(--line); border-radius:7px; overflow:hidden; margin:14px 0 4px; }
+  .meter .lvl { height:100%; width:0; background:var(--accent); }
+  .meter .thr { position:absolute; top:0; bottom:0; width:2px; background:var(--rec); }
+  label { display:block; margin-top:14px; font-size:.9rem; color:var(--muted); }
+  input[type=range] { width:100%; }
+  ul { list-style:none; padding:0; margin:0; }
+  li { border-top:1px solid var(--line); padding:12px 0; }
+  li:first-child { border-top:0; }
+  .meta { font-size:.85rem; color:var(--muted); margin-bottom:6px; }
+  .actions { display:flex; gap:8px; margin-top:8px; }
+  .actions button { flex:1; font:inherit; font-size:.9rem; padding:8px; border-radius:8px; border:1px solid var(--line);
+                    background:transparent; color:var(--fg); }
+  audio { width:100%; }
+  .empty { color:var(--muted); font-size:.9rem; }
+  .head { display:flex; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🎙️ Registratore</h1>
+
+  <div class="card">
+    <button id="toggle">Avvia ascolto</button>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">Fermo</span></div>
+    <div class="sub" id="sub"></div>
+    <div class="meter"><div class="lvl" id="lvl"></div><div class="thr" id="thr"></div></div>
+    <label>Sensibilità: <span id="thrVal"></span> (più basso = si attiva più facilmente)
+      <input type="range" id="threshold" min="1" max="60" value="12">
+    </label>
+    <label>Si ferma dopo <span id="silVal"></span> s di silenzio
+      <input type="range" id="silence" min="3" max="60" step="1" value="15">
+    </label>
+  </div>
+
+  <div class="card">
+    <div class="head"><strong>Registrazioni</strong><span class="empty" id="count"></span></div>
+    <ul id="list"></ul>
+    <p class="empty" id="emptyMsg">Nessuna registrazione. Premi "Avvia ascolto" e parla.</p>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const PRE_ROLL_SEC = 0.5;  // audio tenuto prima dell'attivazione, per non tagliare la prima sillaba
+const MIN_CLIP_SEC = 0.6;  // scarta rumori brevissimi
+
+// ---------- impostazioni (ricordate sul telefono) ----------
+const thresholdEl = $('threshold'), silenceEl = $('silence');
+try {
+  const s = JSON.parse(localStorage.getItem('impostazioni') || '{}');
+  if (s.thr) thresholdEl.value = s.thr;
+  if (s.sil) silenceEl.value = s.sil;
+} catch {}
+function updateLabels() {
+  $('thrVal').textContent = thresholdEl.value;
+  $('silVal').textContent = silenceEl.value;
+  $('thr').style.left = (thresholdEl.value / 60 * 100) + '%';
+  try { localStorage.setItem('impostazioni', JSON.stringify({ thr: thresholdEl.value, sil: silenceEl.value })); } catch {}
+}
+thresholdEl.oninput = silenceEl.oninput = updateLabels;
+updateLabels();
+
+// ---------- archivio offline (IndexedDB, resta sul telefono) ----------
+const dbPromise = new Promise((resolve, reject) => {
+  const r = indexedDB.open('registratore', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('clips', { keyPath: 'id' });
+  r.onsuccess = () => resolve(r.result);
+  r.onerror = () => reject(r.error);
+});
+async function store(mode, fn) {
+  const db = await dbPromise;
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('clips', mode);
+    const req = fn(tx.objectStore('clips'));
+    tx.oncomplete = () => resolve(req && req.result);
+    tx.onerror = () => reject(tx.error);
+  });
+}
+// chiede al sistema di non cancellare i dati quando manca spazio
+if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+
+// ---------- registrazione con attivazione vocale ----------
+let ctx, stream, source, proc, wakeLock = null;
+let listening = false, recording = false;
+let preRoll = [], preRollLen = 0, chunks = [], lastVoiceAt = 0, clipStart = 0;
+
+function setStatus(state) {
+  $('dot').className = 'dot ' + state;
+  $('statusText').textContent = { '': 'Fermo', listening: 'In ascolto…', recording: '● Sto registrando' }[state];
+  if (state !== 'recording') $('sub').textContent = state ? 'Parla e partirà da sola' : '';
+}
+
+$('toggle').onclick = () => listening ? stop() : start();
+
+async function start() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+  } catch (e) {
+    alert('Non riesco ad accedere al microfono: ' + e.message);
+    return;
+  }
+  // 16 kHz basta per la voce e occupa 3 volte meno spazio
+  try { ctx = new AudioContext({ sampleRate: 16000 }); source = ctx.createMediaStreamSource(stream); }
+  catch { ctx = new (window.AudioContext || window.webkitAudioContext)(); source = ctx.createMediaStreamSource(stream); }
+  await ctx.resume();
+  proc = ctx.createScriptProcessor(2048, 1, 1);
+  proc.onaudioprocess = onAudio;
+  source.connect(proc);
+  proc.connect(ctx.destination); // serve perché il processore giri; l'uscita resta muta
+  listening = true;
+  $('toggle').textContent = 'Ferma ascolto';
+  $('toggle').classList.add('on');
+  setStatus('listening');
+  keepScreenOn();
+}
+
+function stop() {
+  if (recording) finishClip();
+  proc.disconnect(); source.disconnect();
+  stream.getTracks().forEach(t => t.stop());
+  ctx.close();
+  listening = false;
+  preRoll = []; preRollLen = 0;
+  $('toggle').textContent = 'Avvia ascolto';
+  $('toggle').classList.remove('on');
+  $('lvl').style.width = '0';
+  setStatus('');
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+
+// lo schermo deve restare acceso: con lo schermo spento il telefono blocca il microfono
+async function keepScreenOn() {
+  try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && listening) keepScreenOn();
+});
+
+function onAudio(e) {
+  const input = new Float32Array(e.inputBuffer.getChannelData(0));
+  e.outputBuffer.getChannelData(0).fill(0);
+
+  let sum = 0;
+  for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+  const level = Math.min(60, Math.sqrt(sum / input.length) * 300);
+  $('lvl').style.width = (level / 60 * 100) + '%';
+
+  const now = ctx.currentTime;
+  const isVoice = level >= +thresholdEl.value;
+
+  if (recording) {
+    chunks.push(input);
+    if (isVoice) lastVoiceAt = now;
+    const quiet = now - lastVoiceAt;
+    $('sub').textContent = quiet > 1 ? `Silenzio: si ferma tra ${Math.ceil(+silenceEl.value - quiet)} s` : 'Sto ascoltando la voce';
+    if (quiet > +silenceEl.value) finishClip();
+  } else {
+    preRoll.push(input); preRollLen += input.length;
+    while (preRollLen - preRoll[0].length > PRE_ROLL_SEC * ctx.sampleRate) preRollLen -= preRoll.shift().length;
+    if (isVoice) {
+      recording = true;
+      chunks = preRoll; preRoll = []; preRollLen = 0;
+      lastVoiceAt = now; clipStart = Date.now();
+      setStatus('recording');
+    }
+  }
+}
+
+function finishClip() {
+  recording = false;
+  setStatus(listening ? 'listening' : '');
+  const total = chunks.reduce((n, c) => n + c.length, 0);
+  // taglia la coda di silenzio, lasciandone 1 secondo
+  const keep = Math.max(0, total - Math.floor(Math.max(0, +silenceEl.value - 1) * ctx.sampleRate));
+  const duration = keep / ctx.sampleRate;
+  if (duration >= MIN_CLIP_SEC) saveClip(encodeWav(chunks, keep, ctx.sampleRate), duration, clipStart);
+  chunks = [];
+}
+
+function encodeWav(chunks, length, rate) {
+  const buf = new ArrayBuffer(44 + length * 2), v = new DataView(buf);
+  const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  w(0, 'RIFF'); v.setUint32(4, 36 + length * 2, true); w(8, 'WAVE');
+  w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, length * 2, true);
+  let off = 44, written = 0;
+  for (const c of chunks) for (let i = 0; i < c.length && written < length; i++, written++, off += 2) {
+    const s = Math.max(-1, Math.min(1, c[i]));
+    v.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+async function saveClip(blob, duration, startedAt) {
+  const d = new Date(startedAt);
+  const pad = n => String(n).padStart(2, '0');
+  const name = `registrazione_${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}.wav`;
+  const clip = { id: startedAt, name, duration, blob };
+  try { await store('readwrite', s => s.put(clip)); }
+  catch (e) { alert('Errore nel salvataggio: ' + e.message); }
+  renderClip(clip, true);
+}
+
+// ---------- elenco ----------
+function renderClip(clip, top) {
+  const url = URL.createObjectURL(clip.blob);
+  const li = document.createElement('li');
+  const when = new Date(clip.id).toLocaleString('it-IT', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  li.innerHTML = `
+    <div class="meta">${when} · ${clip.duration.toFixed(1)} s</div>
+    <audio controls preload="none" src="${url}"></audio>
+    <div class="actions"><button class="exp">📤 Esporta</button><button class="del">🗑 Elimina</button></div>`;
+  li.querySelector('.exp').onclick = () => exportClip(clip, url);
+  li.querySelector('.del').onclick = async () => {
+    if (!confirm('Eliminare questa registrazione?')) return;
+    await store('readwrite', s => s.delete(clip.id));
+    URL.revokeObjectURL(url); li.remove(); refreshCount();
+  };
+  top ? $('list').prepend(li) : $('list').append(li);
+  refreshCount();
+}
+
+// sul telefono apre il menu "Condividi" (Salva su File, WhatsApp, Drive…); altrimenti scarica
+async function exportClip(clip, url) {
+  const file = new File([clip.blob], clip.name, { type: 'audio/wav' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: clip.name }); return; }
+    catch (e) { if (e.name === 'AbortError') return; }
+  }
+  const a = document.createElement('a');
+  a.href = url; a.download = clip.name; a.click();
+}
+
+function refreshCount() {
+  const n = $('list').children.length;
+  $('count').textContent = n ? `${n}` : '';
+  $('emptyMsg').style.display = n ? 'none' : '';
+}
+
+(async () => {
+  try {
+    const all = await store('readonly', s => s.getAll());
+    all.sort((a, b) => b.id - a.id).forEach(c => renderClip(c, false));
+  } catch {}
+  refreshCount();
+})();
+
+// funzionamento offline
+if ('serviceWorker' in navigator && location.protocol !== 'file:') navigator.serviceWorker.register('sw.js').catch(() => {});
+</script>
+</body>
+</html>
